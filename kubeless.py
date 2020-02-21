@@ -1,17 +1,43 @@
 #!/usr/bin/env python
 
+
+# Kubeless Async Python Runtime
+# Copyright (C) 2020  Kazım SARIKAYA <kazimsarikaya@sanaldiyar.com>
+#
+# This file is part of Kubeless Async Python Runtime.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
 import os
+import signal
 import importlib.machinery
 import importlib.util
 import prometheus_client as prom
 import asyncio
 from tornado.web import Application, RequestHandler, URLSpec
 from tornado.httpserver import HTTPServer
-from tornado.ioloop import IOLoop
+from tornado.ioloop import IOLoop, PeriodicCallback
+import tornado.options as tornado_options
 import json
 import time
 import logging
-import sys
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+
+logger = logging.getLogger("kubeless")
 
 loader = importlib.machinery.SourceFileLoader(
     'function',
@@ -44,6 +70,24 @@ function_context = {
 }
 
 
+class Executor:
+
+    def __init__(self):
+        self.cpu_count = multiprocessing.cpu_count()
+        self.tpexecutor = ThreadPoolExecutor(
+            self.cpu_count * os.getenv('___THREAD_MULTIPLIER', 4),
+            "kptpe-%s.%s-" % (os.getenv('MOD_NAME'),
+                              os.getenv('FUNC_HANDLER'),))
+
+    def __call__(self, func, *args, **kwargs):
+        loop = asyncio.get_event_loop()
+        return loop.run_in_executor(self.tpexecutor,
+                                    partial(func, *args, **kwargs))
+
+
+executor = Executor()
+
+
 class HealthzHandler(RequestHandler):
     async def get(self):
         self.write('OK')
@@ -64,7 +108,23 @@ class FunctionHandler(RequestHandler):
         self.data = self.request.body
         if not (ct is None):
             if ct == 'application/json':
-                self.data = json.loads(self.data, "utf-8")
+                try:
+                    self.data = json.loads(self.data.decode("utf-8"))
+                except Exception as e:
+                    logger.error("error at parsing body as json: %s" % (e,))
+                    func_errors.labels(self.request.method).inc()
+        self.event = {
+            'data': self.data,
+            'event-id': self.request.headers.get('event-id', ''),
+            'event-type': self.request.headers.get('event-type', ''),
+            'event-time': self.request.headers.get('event-time', time.time()),
+            'event-namespace': self.request.headers.get('event-namespace', ''),
+            'extensions': {
+                'handler': self,
+                'callback': None,
+                'executor': executor
+            }
+        }
 
     async def get(self):
         return await self.handler()
@@ -79,61 +139,78 @@ class FunctionHandler(RequestHandler):
         return await self.handler()
 
     async def handler(self):
-        event = {
-            'data': self.data,
-            'event-id': self.request.headers.get('event-id', ''),
-            'event-type': self.request.headers.get('event-type', ''),
-            'event-time': self.request.headers.get('event-time', time.time()),
-            'event-namespace': self.request.headers.get('event-namespace', ''),
-            'extensions': {
-                'request': self.request,
-                'callback': None
-            }
-        }
-        method = self.request.method
-        self.callback = None
-        func_calls.labels(method).inc()
-        with func_hist.labels(method).time():
+        func_calls.labels(self.request.method).inc()
+        with func_hist.labels(self.request.method).time():
             try:
                 res = await asyncio.wait_for(
-                    func(event, function_context), timeout=timeout)
-            except asyncio.TimeoutError:
-                self.callback = event["extensions"]["callback"]
-                func_errors.labels(method).inc()
+                    func(self.event, function_context), timeout=timeout)
+            except asyncio.TimeoutError as e:
+                logger.error("timeout occured: %s" % (e,))
+                func_errors.labels(self.request.method).inc()
                 self.clear()
                 self.set_status(408)
                 self.finish({"reason":
                              "Timeout while processing the function"})
+            except Exception as e:
+                logger.error("general error at function execution: %s" % (e,))
+                func_errors.labels(self.request.method).inc()
+                self.clear()
+                self.set_status(500)
+                self.finish({"reason":
+                             "General error while processing the function"})
             else:
-                self.callback = event["extensions"]["callback"]
                 if isinstance(res, Exception):
-                    func_errors.labels(method).inc()
+                    logger.error("error at function execution: %s" % (res,))
+                    func_errors.labels(self.request.method).inc()
                     self.clear()
-                    self.set_status(408)
-                    self.finish({"reason":  res})
-
-                self.finish(res)
+                    self.set_status(500)
+                    self.finish({"reason": "%s" % (res,)})
+                else:
+                    self.finish(res)
 
     def on_finish(self):
-        if not (self.callback is None):
-            self.callback(status=self.get_status())
+        try:
+            callback = self.event["extensions"]["callback"]
+            if not (callback is None):
+                if asyncio.iscoroutinefunction(callback):
+                    asyncio.gather(
+                        callback(self.get_status()))
+                else:
+                    callback(self.get_status())
+        except Exception as e:
+            logger.error("error at callback execution: %s" % (e,))
+            func_errors.labels(self.request.method).inc()
+
+
+class KubelessApplication(Application):
+    is_closing = False
+
+    def signal_handler(self, signum, frame):
+        logger.info('exiting...')
+        self.is_closing = True
+
+    def try_exit(self):
+        if self.is_closing:
+            IOLoop.instance().stop()
+            logger.info('exit success')
 
 
 if __name__ == '__main__':
-    access_log = logging.getLogger('tornado.access')
-    access_log.propagate = False
-    access_log.setLevel(logging.INFO)
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    access_log.addHandler(stdout_handler)
+    tornado_options.parse_command_line()
+
     routes = [
         URLSpec(r'/healthz', HealthzHandler),
         URLSpec(r"/metrics", MetricsHandler),
         URLSpec(r"/", FunctionHandler)
     ]
 
-    app = Application(routes)
+    logger.info("Server is starting")
+    io_loop = IOLoop().current()
+    app = KubelessApplication(routes)
     server = HTTPServer(app)
     server.bind(func_port, reuse_port=True)
     server.start()
-    io_loop = IOLoop().current()
+    signal.signal(signal.SIGINT, app.signal_handler)
+    signal.signal(signal.SIGTERM, app.signal_handler)
+    PeriodicCallback(app.try_exit, 100).start()
     io_loop.start()
