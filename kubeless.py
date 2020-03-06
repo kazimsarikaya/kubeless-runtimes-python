@@ -36,6 +36,7 @@ import logging
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+import uvloop
 
 logger = logging.getLogger("kubeless")
 
@@ -75,7 +76,7 @@ class Executor:
     def __init__(self):
         self.cpu_count = multiprocessing.cpu_count()
         self.tpexecutor = ThreadPoolExecutor(
-            self.cpu_count * os.getenv('___THREAD_MULTIPLIER', 4),
+            self.cpu_count * int(os.getenv('___THREAD_MULTIPLIER', 4)),
             "kptpe-%s.%s-" % (os.getenv('MOD_NAME'),
                               os.getenv('FUNC_HANDLER'),))
 
@@ -205,6 +206,8 @@ if __name__ == '__main__':
     ]
 
     logger.info("Server is starting")
+    loop = uvloop.new_event_loop()
+    asyncio.set_event_loop(loop)
     io_loop = IOLoop().current()
     app = KubelessApplication(routes)
     server = HTTPServer(app)

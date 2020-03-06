@@ -14,7 +14,7 @@ ENV BITNAMI_APP_NAME="python" \
 RUN curl https://bootstrap.pypa.io/get-pip.py --output get-pip.py
 RUN python ./get-pip.py
 
-RUN pip install tornado prometheus_client aiopg
+RUN pip install tornado prometheus_client uvloop
 
 WORKDIR /
 ADD kubeless.py .
