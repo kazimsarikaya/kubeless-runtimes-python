@@ -139,6 +139,9 @@ class FunctionHandler(RequestHandler):
     async def delete(self):
         return await self.handler()
 
+    async def options(self):
+        return await self.handler()
+
     async def handler(self):
         func_calls.labels(self.request.method).inc()
         with func_hist.labels(self.request.method).time():
